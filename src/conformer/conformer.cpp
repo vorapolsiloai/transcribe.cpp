@@ -687,7 +687,18 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
             return ggml_cont(ctx, ggml_permute(ctx, t, 0, 2, 1, 3));
         };
         q_u = block_queries(q_u);
-        q_v = block_queries(q_v);
+        // The position scores need q_v blocked differently: every block
+        // shares the same p, so fold the blocks into the row axis instead of
+        // ne[3]. [head_dim, n_head, T_pad*B] -> [head_dim, C*N*B, n_head, 1];
+        // row j + C*slot is query j of block slot (the padded time axis
+        // already lies in that order). A broadcast over ne[3] would be
+        // rejected by backends without dim-3 mul_mat broadcast (Vulkan) and
+        // fall back to the CPU once per layer.
+        if (pad_right > 0) {
+            q_v = ggml_pad_ext(ctx, q_v, 0, 0, 0, 0, 0, static_cast<int>(pad_right), 0, 0);
+        }
+        q_v = ggml_reshape_3d(ctx, q_v, head_dim, n_head, C * NB);
+        q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 2, 1, 3));
 
         // Materialize overlapping K/V windows with the existing 1-D
         // im2col op. Pad the ragged tail to a complete chunk first;
@@ -748,13 +759,14 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         p = ggml_reshape_4d(ctx, p, head_dim, n_head, pos_len, 1);
         p = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
 
-        // Position scores [pos_len, C, n_head, N*B]. The relative shift is
+        // Position scores [pos_len, C*N*B, n_head]. The relative shift is
         // the same strided view as shifted_view below, with the rectangular
-        // [W, C] geometry: out[k, q] = in[k - q + C - 1, q].
+        // [W, C] geometry: out[k, q] = in[k - q + C - 1, q]; block n starts
+        // C rows further on.
         ggml_tensor * scores       = ggml_mul_mat(ctx, p, q_v);
         const size_t  query_stride = C == 1 ? static_cast<size_t>(W) * scores->nb[0] : scores->nb[1] - scores->nb[0];
         ggml_tensor * matrix_bd =
-            ggml_view_4d(ctx, scores, W, C, n_head, NB, query_stride, scores->nb[2], scores->nb[3],
+            ggml_view_4d(ctx, scores, W, C, n_head, NB, query_stride, scores->nb[2], static_cast<size_t>(C) * scores->nb[1],
                          /*offset=*/(C - 1) * scores->nb[0]);
 
         ggml_tensor * o = nullptr;
