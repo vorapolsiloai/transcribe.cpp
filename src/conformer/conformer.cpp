@@ -668,11 +668,15 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         q_u = ggml_pad_ext(ctx, q_u, 0, 0, 0, 0, 0, static_cast<int>(pad_right), 0, 0);
         q_v = ggml_pad_ext(ctx, q_v, 0, 0, 0, 0, 0, static_cast<int>(pad_right), 0, 0);
         q_u = ggml_cont(ctx, ggml_permute(ctx, q_u, 0, 2, 1, 3));
-        q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 2, 1, 3));
         q_u = ggml_reshape_4d(ctx, q_u, head_dim, C, N, n_head);
-        q_v = ggml_reshape_4d(ctx, q_v, head_dim, C, N, n_head);
         q_u = ggml_cont(ctx, ggml_permute(ctx, q_u, 0, 1, 3, 2));
-        q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 1, 3, 2));
+        // The position scores need q_v blocked differently: every chunk
+        // shares the same p, so keep the chunks folded into the row axis
+        // instead of ne[3]: [head_dim, C*N, n_head, 1], row j + C*n is query j
+        // of chunk n. A broadcast over ne[3] would be rejected by backends
+        // without dim-3 mul_mat broadcast (Vulkan) and fall back to the CPU
+        // once per layer.
+        q_v = ggml_cont(ctx, ggml_permute(ctx, q_v, 0, 2, 1, 3));
 
         // Materialize overlapping K/V windows with the existing 1-D
         // im2col op. Pad the ragged tail to a complete chunk first;
@@ -721,13 +725,15 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         p = ggml_reshape_4d(ctx, p, head_dim, n_head, pos_len, 1);
         p = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
 
-        // Position scores [pos_len, C, n_head, N]. The relative shift is the
+        // Position scores [pos_len, C*N, n_head]. The relative shift is the
         // same strided view as shifted_view below, with the rectangular
-        // [W, C] geometry: out[k, q] = in[k - q + C - 1, q].
+        // [W, C] geometry: out[k, q] = in[k - q + C - 1, q]; chunk n starts
+        // C rows further on.
         ggml_tensor * scores       = ggml_mul_mat(ctx, p, q_v);
         const size_t  query_stride = C == 1 ? static_cast<size_t>(W) * scores->nb[0] : scores->nb[1] - scores->nb[0];
-        ggml_tensor * matrix_bd = ggml_view_4d(ctx, scores, W, C, n_head, N, query_stride, scores->nb[2], scores->nb[3],
-                                               /*offset=*/(C - 1) * scores->nb[0]);
+        ggml_tensor * matrix_bd =
+            ggml_view_4d(ctx, scores, W, C, n_head, N, query_stride, scores->nb[2], static_cast<size_t>(C) * scores->nb[1],
+                         /*offset=*/(C - 1) * scores->nb[0]);
 
         ggml_tensor * o = nullptr;
         if (use_flash) {
