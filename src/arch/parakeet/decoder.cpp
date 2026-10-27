@@ -608,9 +608,10 @@ HostPredictor::~HostPredictor() {
 }
 
 // Resolve a decode thread count: n_threads <= 0 means "auto" →
-// default_n_threads() (min(8, usable cpus)), matching the encoder.
+// default_n_threads(), kept at most 8: the host decoder works on small
+// per-step tensors where more threads only add barrier cost.
 static int resolve_decode_threads(int n_threads) {
-    return n_threads > 0 ? n_threads : transcribe::default_n_threads();
+    return n_threads > 0 ? n_threads : std::min(transcribe::default_n_threads(), 8);
 }
 
 transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDecoderWeights & out) {

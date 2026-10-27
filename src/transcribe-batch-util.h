@@ -93,8 +93,11 @@ template <typename Thread = std::thread, typename Fn> void run_on_threads(int n_
 // the usable cores and ggml's spin-wait barriers livelock.
 // CAVEAT: the affinity mask reflects taskset/cpuset but NOT a CFS bandwidth
 // quota (`docker --cpus=N` without --cpuset) — that case still over-counts.
-// A cap <= 0 disables the clamp (use all usable CPUs).
-int default_n_threads(int cap = 8);
+// With cap > 0 the count is the usable PHYSICAL cores (SMT siblings once),
+// never below min(8, usable CPUs), clamped to cap. A cap <= 0 disables the
+// clamp and returns every usable logical CPU (the host parallel-for).
+// TRANSCRIBE_N_THREADS=N (N > 0) overrides both.
+int default_n_threads(int cap = 16);
 
 // Resolve a CPU thread count and apply it to every CPU/BLAS backend in `sched`
 // via ggml_backend_set_n_threads. `requested <= 0` means default_n_threads().

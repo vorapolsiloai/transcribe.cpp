@@ -4,18 +4,25 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "transcribe-env.h"
 #include "transcribe-log.h"
 #include "transcribe-repetition-guard.h"
 #include "transcribe-session.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <set>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__linux__)
 #    include <sched.h>
+#elif defined(__APPLE__)
+#    include <sys/sysctl.h>
 #elif defined(_WIN32)
 #    ifndef WIN32_LEAN_AND_MEAN
 #        define WIN32_LEAN_AND_MEAN
@@ -56,15 +63,109 @@ static int usable_cpu_count() {
     return hw > 0 ? static_cast<int>(hw) : 1;
 }
 
-int default_n_threads(int cap) {
-    int n = usable_cpu_count();
-    if (n < 1) {
-        n = 1;
+// Number of physical cores the process may run on (SMT siblings counted
+// once), or 0 when the platform query is unavailable or fails.
+static int physical_core_count() {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+        return 0;
     }
-    if (cap > 0 && n > cap) {
-        n = cap;
+    std::set<std::pair<long, long>> cores;  // (package, core) pairs
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &set)) {
+            continue;
+        }
+        auto read_id = [cpu](const char * file) -> long {
+            char path[128];
+            std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, file);
+            FILE * f = std::fopen(path, "r");
+            if (f == nullptr) {
+                return -1;
+            }
+            long v = -1;
+            if (std::fscanf(f, "%ld", &v) != 1) {
+                v = -1;
+            }
+            std::fclose(f);
+            return v;
+        };
+        const long core = read_id("core_id");
+        if (core < 0) {
+            return 0;
+        }
+        cores.emplace(read_id("physical_package_id"), core);
+    }
+    return static_cast<int>(cores.size());
+#elif defined(_WIN32)
+    // Restrict to the affinity mask when the process lives in one processor
+    // group (the common case); across groups, count every core.
+    USHORT     groups[1] = { 0 };
+    USHORT     n_groups  = 1;  // fails with ERROR_INSUFFICIENT_BUFFER across groups
+    DWORD_PTR  proc_mask = 0;
+    DWORD_PTR  sys_mask  = 0;
+    const bool use_mask  = GetProcessGroupAffinity(GetCurrentProcess(), &n_groups, groups) && n_groups == 1 &&
+                          GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) && proc_mask != 0;
+    const USHORT group   = groups[0];
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) {
+        return 0;
+    }
+    std::vector<char> buf(len);
+    auto * info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buf.data());
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) {
+        return 0;
+    }
+    int n = 0;
+    for (DWORD off = 0; off < len;) {
+        auto * rec = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buf.data() + off);
+        if (rec->Relationship == RelationProcessorCore) {
+            bool allowed = !use_mask;
+            for (WORD g = 0; use_mask && g < rec->Processor.GroupCount; ++g) {
+                const GROUP_AFFINITY & ga = rec->Processor.GroupMask[g];
+                if (ga.Group == group && (ga.Mask & proc_mask) != 0) {
+                    allowed = true;
+                }
+            }
+            n += allowed ? 1 : 0;
+        }
+        off += rec->Size;
     }
     return n;
+#elif defined(__APPLE__)
+    int    n  = 0;
+    size_t sz = sizeof(n);
+    if (sysctlbyname("hw.physicalcpu", &n, &sz, nullptr, 0) == 0 && n > 0) {
+        return n;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+int default_n_threads(int cap) {
+    if (const char * env_n = env::str("TRANSCRIBE_N_THREADS")) {
+        const long v = std::strtol(env_n, nullptr, 10);
+        if (v > 0) {
+            return static_cast<int>(std::min<long>(v, 512));
+        }
+    }
+    const int logical = std::max(1, usable_cpu_count());
+    if (cap <= 0) {
+        return logical;
+    }
+    // One thread per physical core: SMT siblings share the vector units the
+    // ggml kernels saturate, so counting them adds barrier cost, not
+    // throughput. Never go below the previous default of min(8, usable CPUs).
+    const int physical = physical_core_count();
+    int       n        = std::min(8, logical);
+    if (physical > 0) {
+        n = std::max(n, std::min(physical, logical));
+    }
+    return std::min(n, cap);
 }
 
 int configure_sched_n_threads(ggml_backend_sched_t sched, int requested) {
